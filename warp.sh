@@ -1,11 +1,10 @@
 #!/bin/bash
 
 # ==========================================
-# WARP Client Proxy Mode 一键脚本 (终极版)
+# WARP Client Proxy Mode 一键脚本 (V3 修复版)
 # 更新日志：
-# - 启动时若检测到运行，先显示当前 IP 状态
-# - 新增"仅重启服务"选项 (Restart Service Only)
-# - 优化服务等待逻辑，避免重启时报错
+# - 修复检测逻辑：不再依赖 socket 文件路径，改为通过 CLI 响应判断服务状态
+# - 解决了服务已启动但脚本提示超时的问题
 # ==========================================
 
 # 颜色配置
@@ -21,24 +20,36 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
-# ================= 核心工具函数 =================
+# ================= 核心修复位置 =================
 
-# 1. 等待服务就绪 (通用函数)
+# 1. 等待服务就绪 (V3 改进版)
 wait_for_service() {
     echo -e "${YELLOW}正在等待 WARP 服务就绪...${PLAIN}"
     local RETRIES=0
     while [ $RETRIES -lt 30 ]; do
-        # 检查服务状态 AND socket 文件是否存在
-        if systemctl is-active --quiet warp-svc && [[ -S /var/lib/cloudflare-warp/warp_service.sock || -S /run/cloudflare-warp/warp_service.sock ]]; then
-            echo -e "${GREEN}服务已就绪！${PLAIN}"
-            return 0
+        # 方法1: 优先检查 systemd 状态
+        if systemctl is-active --quiet warp-svc; then
+            # 方法2: 尝试运行 status 命令
+            # 只要 warp-cli 能返回输出，且不报错"Unable to connect"，就说明后台活了
+            local CLI_OUTPUT=$(timeout 2 warp-cli status 2>&1)
+            if [[ "$CLI_OUTPUT" != *"Unable to connect"* ]]; then
+                echo -e "${GREEN}服务已就绪！${PLAIN}"
+                return 0
+            fi
         fi
         sleep 1
         ((RETRIES++))
     done
-    echo -e "${RED}服务启动/重启超时！建议查看日志: systemctl status warp-svc${PLAIN}"
-    exit 1
+    
+    # 如果还是超时，打印调试信息
+    echo -e "${RED}服务检测超时 (但服务可能已启动)${PLAIN}"
+    echo -e "${YELLOW}尝试强制显示当前状态：${PLAIN}"
+    systemctl status warp-svc --no-pager | head -n 5
+    # 这里不再 exit 1，而是尝试继续运行，因为可能是误报
+    return 0 
 }
+
+# ================= 其他功能保持不变 =================
 
 # 2. 状态检测与输出
 verify_status() {
@@ -110,8 +121,8 @@ check_if_running() {
         echo -e "${YELLOW}========================================${PLAIN}"
         
         echo -e "请选择操作："
-        echo -e " ${GREEN}1.${PLAIN} 强制重装并重置 (Reinstall & Reset) - [适用于完全无法使用]"
-        echo -e " ${GREEN}2.${PLAIN} 仅重启服务 (Restart Service) - [适用于连接不稳定/无网络]"
+        echo -e " ${GREEN}1.${PLAIN} 强制重装并重置 (Reinstall & Reset)"
+        echo -e " ${GREEN}2.${PLAIN} 仅重启服务 (Restart Service)"
         echo -e " ${GREEN}3.${PLAIN} 退出 (Exit)"
         echo -e ""
         read -p "请输入数字 [1-3]: " choice
@@ -119,11 +130,11 @@ check_if_running() {
         case "$choice" in
             1 )
                 echo -e "${CYAN}用户选择重装，即将开始...${PLAIN}"
-                return 0 # 继续执行后续的安装流程
+                return 0
                 ;;
             2 )
                 restart_warp_only
-                exit 0 # 重启完直接退出
+                exit 0
                 ;;
             * )
                 echo -e "${GREEN}已退出。${PLAIN}"
@@ -184,10 +195,8 @@ configure_warp() {
 }
 
 # --- 主程序流程 ---
-install_dependencies # 必须先跑，为了有 jq 和 curl 检查状态
-check_if_running     # 检查状态并显示菜单 (如果是选重启，会在这里结束)
-
-# 如果用户选了 1 (重装)，或者是第一次安装，才会执行下面这些
+install_dependencies
+check_if_running
 install_warp
 start_service_initial
 configure_warp
