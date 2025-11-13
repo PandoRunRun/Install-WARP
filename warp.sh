@@ -1,10 +1,10 @@
 #!/bin/bash
 
 # ==========================================
-# WARP Client Proxy Mode 一键脚本 (V3 修复版)
+# WARP Client Proxy Mode 一键脚本 (V4 ip.sb版)
 # 更新日志：
-# - 修复检测逻辑：不再依赖 socket 文件路径，改为通过 CLI 响应判断服务状态
-# - 解决了服务已启动但脚本提示超时的问题
+# - 将 IP 检测源更换为更稳定的 api.ip.sb/geoip
+# - 修复了 IPv6 检测可能因超时而误报失败的问题
 # ==========================================
 
 # 颜色配置
@@ -20,52 +20,34 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
-# ================= 核心修复位置 =================
+# ================= 状态检测逻辑 (核心修改) =================
 
-# 1. 等待服务就绪 (V3 改进版)
-wait_for_service() {
-    echo -e "${YELLOW}正在等待 WARP 服务就绪...${PLAIN}"
-    local RETRIES=0
-    while [ $RETRIES -lt 30 ]; do
-        # 方法1: 优先检查 systemd 状态
-        if systemctl is-active --quiet warp-svc; then
-            # 方法2: 尝试运行 status 命令
-            # 只要 warp-cli 能返回输出，且不报错"Unable to connect"，就说明后台活了
-            local CLI_OUTPUT=$(timeout 2 warp-cli status 2>&1)
-            if [[ "$CLI_OUTPUT" != *"Unable to connect"* ]]; then
-                echo -e "${GREEN}服务已就绪！${PLAIN}"
-                return 0
-            fi
-        fi
-        sleep 1
-        ((RETRIES++))
-    done
-    
-    # 如果还是超时，打印调试信息
-    echo -e "${RED}服务检测超时 (但服务可能已启动)${PLAIN}"
-    echo -e "${YELLOW}尝试强制显示当前状态：${PLAIN}"
-    systemctl status warp-svc --no-pager | head -n 5
-    # 这里不再 exit 1，而是尝试继续运行，因为可能是误报
-    return 0 
-}
-
-# ================= 其他功能保持不变 =================
-
-# 2. 状态检测与输出
 verify_status() {
-    echo -e "\n${CYAN}正在检测连接状态 (IP 信息)...${PLAIN}"
+    echo -e "\n${CYAN}正在检测连接状态 (使用 api.ip.sb)...${PLAIN}"
     
     check_ip() {
-        local type=$1
-        local result=$(curl -s -m 10 -x socks5h://127.0.0.1:40000 -$type http://ip-api.com/json?fields=query,country,isp,status)
+        local type=$1 # 传入 4 或 6
         
-        if [[ $(echo "$result" | jq -r '.status') == "success" ]]; then
-            local ip=$(echo "$result" | jq -r '.query')
+        # 使用 api.ip.sb/geoip 获取 JSON 信息
+        # -s: 静默模式
+        # -m 15: 最多等待 15秒 (防止 IPv6 握手慢)
+        # -x socks5h://...: 强制走代理
+        local result=$(curl -s -m 15 -x socks5h://127.0.0.1:40000 -$type https://api.ip.sb/geoip)
+        
+        # 简单的校验：如果返回结果里包含 "country" 这个词，说明获取 JSON 成功了
+        if [[ "$result" == *"country"* ]]; then
+            local ip=$(echo "$result" | jq -r '.ip')
             local country=$(echo "$result" | jq -r '.country')
             local isp=$(echo "$result" | jq -r '.isp')
             echo -e " WARP Free IPv${type}: ${GREEN}${ip}${PLAIN} ${YELLOW}${country}${PLAIN} ${CYAN}${isp}${PLAIN}"
         else
-            echo -e " WARP Free IPv${type}: ${RED}连接失败 或 无此网络栈${PLAIN}"
+            # 如果失败，尝试仅获取 IP (兜底方案，对应你说的 ipv4.ip.sb)
+            local simple_ip=$(curl -s -m 5 -x socks5h://127.0.0.1:40000 -$type https://ipv${type}.ip.sb)
+            if [[ -n "$simple_ip" ]]; then
+                 echo -e " WARP Free IPv${type}: ${GREEN}${simple_ip}${PLAIN} ${YELLOW}(无法获取位置信息)${PLAIN}"
+            else
+                 echo -e " WARP Free IPv${type}: ${RED}连接失败 或 无此网络栈${PLAIN}"
+            fi
         fi
     }
 
@@ -78,7 +60,28 @@ verify_status() {
     echo -e "===================================================="
 }
 
-# 3. 仅重启服务逻辑
+# ================= 以下逻辑保持稳定 (V3版修复代码) =================
+
+# 等待服务就绪
+wait_for_service() {
+    echo -e "${YELLOW}正在等待 WARP 服务就绪...${PLAIN}"
+    local RETRIES=0
+    while [ $RETRIES -lt 30 ]; do
+        if systemctl is-active --quiet warp-svc; then
+            local CLI_OUTPUT=$(timeout 2 warp-cli status 2>&1)
+            if [[ "$CLI_OUTPUT" != *"Unable to connect"* ]]; then
+                echo -e "${GREEN}服务已就绪！${PLAIN}"
+                return 0
+            fi
+        fi
+        sleep 1
+        ((RETRIES++))
+    done
+    echo -e "${RED}服务检测超时 (但服务可能已启动)${PLAIN}"
+    return 0 
+}
+
+# 仅重启服务
 restart_warp_only() {
     echo -e "${CYAN}正在重启 WARP 服务...${PLAIN}"
     systemctl restart warp-svc
@@ -88,7 +91,7 @@ restart_warp_only() {
     verify_status
 }
 
-# 4. 系统检测与依赖安装
+# 依赖安装
 install_dependencies() {
     echo -e "${CYAN}正在初始化环境并安装依赖...${PLAIN}"
     if [ -f /etc/debian_version ]; then
@@ -112,7 +115,7 @@ install_dependencies() {
     fi
 }
 
-# 5. 智能监测逻辑 (带菜单)
+# 智能监测
 check_if_running() {
     if command -v warp-cli &> /dev/null && systemctl is-active --quiet warp-svc; then
         echo -e "\n${YELLOW}========================================${PLAIN}"
@@ -128,23 +131,14 @@ check_if_running() {
         read -p "请输入数字 [1-3]: " choice
         
         case "$choice" in
-            1 )
-                echo -e "${CYAN}用户选择重装，即将开始...${PLAIN}"
-                return 0
-                ;;
-            2 )
-                restart_warp_only
-                exit 0
-                ;;
-            * )
-                echo -e "${GREEN}已退出。${PLAIN}"
-                exit 0
-                ;;
+            1 ) echo -e "${CYAN}用户选择重装...${PLAIN}"; return 0 ;;
+            2 ) restart_warp_only; exit 0 ;;
+            * ) echo -e "${GREEN}已退出。${PLAIN}"; exit 0 ;;
         esac
     fi
 }
 
-# 6. 安装 WARP
+# 安装与配置
 install_warp() {
     echo -e "${CYAN}正在安装/更新 Cloudflare WARP...${PLAIN}"
     if [ -f /etc/debian_version ]; then
@@ -154,7 +148,6 @@ install_warp() {
     fi
 }
 
-# 7. 启动服务 (安装模式用)
 start_service_initial() {
     echo -e "${CYAN}正在启动 WARP 服务...${PLAIN}"
     systemctl enable warp-svc
@@ -162,19 +155,14 @@ start_service_initial() {
     wait_for_service
 }
 
-# 8. 配置 WARP
 configure_warp() {
     echo -e "${CYAN}正在配置 Proxy 模式 (端口 40000)...${PLAIN}"
-    
-    # 强制断开并重置旧配置
     warp-cli disconnect &>/dev/null
     rm -rf /var/lib/cloudflare-warp/reg.json &>/dev/null
 
-    # 智能识别版本
     HELP_INFO=$(warp-cli --help)
     
     if echo "$HELP_INFO" | grep -q "registration"; then
-        # 新版语法
         warp-cli mode proxy
         warp-cli proxy port 40000
         echo -e "${YELLOW}正在注册账号...${PLAIN}"
@@ -182,7 +170,6 @@ configure_warp() {
         echo -e "${YELLOW}正在连接...${PLAIN}"
         warp-cli connect
     else
-        # 旧版语法
         warp-cli set-mode proxy
         warp-cli set-proxy-port 40000
         echo -e "${YELLOW}正在注册账号...${PLAIN}"
@@ -190,7 +177,6 @@ configure_warp() {
         echo -e "${YELLOW}正在连接...${PLAIN}"
         warp-cli connect
     fi
-    
     sleep 5
 }
 
